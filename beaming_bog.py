@@ -3,6 +3,9 @@ from bs4 import BeautifulSoup
 import csv
 from urllib.parse import urlparse, urljoin
 import re
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+import threading
 
 EXCLUDED_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'pdf', 'docx', 'xlsx', 'zip', 'rar']
 
@@ -31,8 +34,7 @@ def scrape_page(url, domain):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36'}
         response = requests.get(url, headers=headers)
-        print('got something')
-        print(response)
+        #print(response)
         if 'text/html' not in response.headers.get('Content-Type', ''):
             print(f"Filtered out: {url}")
             return None, []
@@ -74,39 +76,67 @@ def main():
 
     domain = get_domain(start_url)
     visited_urls = set()
-    to_visit_urls = {start_url}
+    to_visit_urls = Queue()
+    to_visit_urls.put(start_url)
     all_headers = set(['URL', 'Title', 'META Description', 'Status code'])
     all_rows = []
     retry_urls = []
+    
+    # Add thread safety
+    visited_urls_lock = threading.Lock()
+    all_rows_lock = threading.Lock()
+    all_headers_lock = threading.Lock()
 
-    def getData():
-        while to_visit_urls:
-            current_url = to_visit_urls.pop()
-            visited_urls.add(current_url)
+    def process_url(current_url):
+        if is_pagination_link(current_url):
+            return
 
-            if is_pagination_link(current_url):
-                continue
-
-            page_data, links = scrape_page(current_url, domain)
-            if page_data:
+        page_data, links = scrape_page(current_url, domain)
+        if page_data:
+            with all_headers_lock:
                 all_headers.update(page_data.keys())
-                if page_data['Status code'] == 429:
-                    retry_urls.append(current_url)
-                else:
+            
+            if page_data['Status code'] == 429:
+                retry_urls.append(current_url)
+            else:
+                with all_rows_lock:
                     all_rows.append(page_data)
-                    print(f"{current_url} ✅")
-                    
-                    for link in links:
+                print(f"{current_url} ✅")
+                
+                for link in links:
+                    with visited_urls_lock:
                         if link not in visited_urls:
-                            to_visit_urls.add(link)
-    getData()
+                            to_visit_urls.put(link)
 
-    if retry_urls.__len__ != 0:
-        print(f"retying {retry_urls.__len__} urls")
+    def worker():
+        while True:
+            try:
+                current_url = to_visit_urls.get(timeout=2)  # 2 second timeout
+                with visited_urls_lock:
+                    if current_url in visited_urls:
+                        to_visit_urls.task_done()
+                        continue
+                    visited_urls.add(current_url)
+                
+                process_url(current_url)
+                to_visit_urls.task_done()
+            except Exception:  # Queue.Empty or other exceptions
+                break
+
+    # First pass with multiple threads
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        workers = [executor.submit(worker) for _ in range(10)]
+        to_visit_urls.join()
+
+    # Handle retry URLs if any
+    if retry_urls:
+        print(f"retrying {len(retry_urls)} urls")
         for retry_url in retry_urls:
-            to_visit_urls.add(retry_url)
-        getData()
-
+            to_visit_urls.put(retry_url)
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:  # Less workers for retries
+            workers = [executor.submit(worker) for _ in range(5)]
+            to_visit_urls.join()
 
     # Write the scraped data to CSV
     sanitised_url = re.sub(r'[\\/:*?"<>|\s]', '_', start_url)
